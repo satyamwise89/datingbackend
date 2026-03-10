@@ -6,7 +6,11 @@ import fs from "fs";
 import { nanoid } from "nanoid";
 import path from "path";
 
-const { PORT = 3000, ALLOWED_ORIGINS = "" } = process.env;
+const {
+  PORT = 3000,
+  ALLOWED_ORIGINS = "",
+  BACKEND_SHARED_SECRET = "",
+} = process.env;
 const APP_VERSION = process.env.RENDER_GIT_COMMIT || process.env.npm_package_version || "dev";
 const allowedOrigins = ALLOWED_ORIGINS
   .split(",")
@@ -182,6 +186,23 @@ function createRateLimit({ key, max, windowMs }) {
   };
 }
 
+function requireSharedSecret(req, res, next) {
+  if (!BACKEND_SHARED_SECRET) {
+    return next();
+  }
+
+  const headerValue = req.headers["x-backend-secret"];
+  if (headerValue === BACKEND_SHARED_SECRET) {
+    return next();
+  }
+
+  return res.status(401).json({
+    ok: false,
+    error: "unauthorized",
+    requestId: req.requestId,
+  });
+}
+
 const notificationRateLimit = createRateLimit({
   key: "notify",
   max: 60,
@@ -301,8 +322,8 @@ app.get("/events", (req, res) => {
   req.on("close", () => sseClients.delete(res));
 });
 
-app.post("/send-call", callRateLimit, handleSendCall);
-app.post("/send-call-notification", callRateLimit, handleSendCall);
+app.post("/send-call", requireSharedSecret, callRateLimit, handleSendCall);
+app.post("/send-call-notification", requireSharedSecret, callRateLimit, handleSendCall);
 
 async function handleSendCall(req, res) {
   try {
@@ -378,7 +399,7 @@ async function handleSendCall(req, res) {
   }
 }
 
-app.post("/send-chat", notificationRateLimit, async (req, res) => {
+app.post("/send-chat", requireSharedSecret, notificationRateLimit, async (req, res) => {
   try {
     const { receiverFcmToken, title, body, chatId, senderId, senderName } = req.body;
     const missing = requireFields(req.body, ["receiverFcmToken"]);
@@ -408,7 +429,7 @@ app.post("/send-chat", notificationRateLimit, async (req, res) => {
   }
 });
 
-app.post("/notify/message", notificationRateLimit, async (req, res) => {
+app.post("/notify/message", requireSharedSecret, notificationRateLimit, async (req, res) => {
   try {
     const { roomId, messageId, senderId, receiverId, message, type } = req.body;
     const missing = requireFields(req.body, ["roomId", "senderId", "receiverId"]);
@@ -460,7 +481,7 @@ app.post("/notify/message", notificationRateLimit, async (req, res) => {
   }
 });
 
-app.post("/notify/like", notificationRateLimit, async (req, res) => {
+app.post("/notify/like", requireSharedSecret, notificationRateLimit, async (req, res) => {
   try {
     const { postId, actorId } = req.body;
     const missing = requireFields(req.body, ["postId", "actorId"]);
@@ -507,7 +528,7 @@ app.post("/notify/like", notificationRateLimit, async (req, res) => {
   }
 });
 
-app.post("/notify/follow", notificationRateLimit, async (req, res) => {
+app.post("/notify/follow", requireSharedSecret, notificationRateLimit, async (req, res) => {
   try {
     const { userId, followerId } = req.body;
     const missing = requireFields(req.body, ["userId", "followerId"]);
@@ -530,7 +551,7 @@ app.post("/notify/follow", notificationRateLimit, async (req, res) => {
   }
 });
 
-app.post("/story/reply", notificationRateLimit, async (req, res) => {
+app.post("/story/reply", requireSharedSecret, notificationRateLimit, async (req, res) => {
   try {
     const { storyId, senderId, message } = req.body;
     const missing = requireFields(req.body, ["storyId", "senderId"]);
@@ -564,7 +585,7 @@ app.post("/story/reply", notificationRateLimit, async (req, res) => {
   }
 });
 
-app.post("/activity/visit", notificationRateLimit, async (req, res) => {
+app.post("/activity/visit", requireSharedSecret, notificationRateLimit, async (req, res) => {
   try {
     const { userId, visitorId } = req.body;
     const missing = requireFields(req.body, ["userId", "visitorId"]);
