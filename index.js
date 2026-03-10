@@ -7,6 +7,7 @@ import { nanoid } from "nanoid";
 import path from "path";
 
 const { PORT = 3000 } = process.env;
+const APP_VERSION = process.env.RENDER_GIT_COMMIT || process.env.npm_package_version || "dev";
 
 function parseServiceAccountFromEnv() {
   const raw = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
@@ -76,15 +77,50 @@ const messaging = admin.messaging();
 const app = express();
 app.use(cors());
 app.use(bodyParser.json({ limit: "10mb" }));
+app.disable("x-powered-by");
 
 const liveCalls = [];
 const sseClients = new Set();
+
+app.use((req, res, next) => {
+  const requestId = nanoid(10);
+  req.requestId = requestId;
+  res.setHeader("x-request-id", requestId);
+  const startedAt = Date.now();
+  res.on("finish", () => {
+    console.log(
+      `[${new Date().toISOString()}] ${req.method} ${req.originalUrl} ${res.statusCode} ${Date.now() - startedAt}ms ${requestId}`
+    );
+  });
+  next();
+});
 
 function broadcast(event) {
   const data = `data: ${JSON.stringify(event)}\n\n`;
   for (const res of sseClients) {
     res.write(data);
   }
+}
+
+function badRequest(res, error, requestId) {
+  return res.status(400).json({ ok: false, error, requestId });
+}
+
+function internalError(res, error, requestId) {
+  console.error(error);
+  return res.status(500).json({
+    ok: false,
+    error: error.message || "internal",
+    requestId,
+  });
+}
+
+function requireFields(body, fields) {
+  const missing = fields.filter((field) => {
+    const value = body[field];
+    return value === undefined || value === null || value === "";
+  });
+  return missing;
 }
 
 async function pushActivity(userId, payload) {
@@ -137,7 +173,12 @@ async function profileVisitAlreadyHandled(userId, visitorId) {
 }
 
 app.get("/ping", (_req, res) => {
-  res.json({ ok: true, service: "auraconnect-backend" });
+  res.json({
+    ok: true,
+    service: "auraconnect-backend",
+    version: APP_VERSION,
+    uptimeSeconds: Math.round(process.uptime()),
+  });
 });
 
 app.get("/", (_req, res) => {
@@ -204,11 +245,19 @@ async function handleSendCall(req, res) {
       receiverId = "<hidden>",
     } = req.body;
 
-    if (!callId || !callerId || !callerName || !channelId || !receiverFcmToken) {
-      return res.status(400).json({
-        error:
-          "missing fields: callId, callerId, callerName, channelId, receiverFcmToken",
-      });
+    const missing = requireFields(req.body, [
+      "callId",
+      "callerId",
+      "callerName",
+      "channelId",
+      "receiverFcmToken",
+    ]);
+    if (missing.length > 0) {
+      return badRequest(
+        res,
+        `missing fields: ${missing.join(", ")}`,
+        req.requestId
+      );
     }
 
     await messaging.send({
@@ -252,18 +301,18 @@ async function handleSendCall(req, res) {
     liveCalls.unshift(event);
     broadcast(event);
 
-    res.json({ ok: true });
+    res.json({ ok: true, requestId: req.requestId });
   } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: error.message || "internal" });
+    return internalError(res, error, req.requestId);
   }
 }
 
 app.post("/send-chat", async (req, res) => {
   try {
     const { receiverFcmToken, title, body, chatId, senderId, senderName } = req.body;
-    if (!receiverFcmToken) {
-      return res.status(400).json({ error: "receiverFcmToken required" });
+    const missing = requireFields(req.body, ["receiverFcmToken"]);
+    if (missing.length > 0) {
+      return badRequest(res, "receiverFcmToken required", req.requestId);
     }
 
     await messaging.send({
@@ -282,24 +331,24 @@ app.post("/send-chat", async (req, res) => {
       },
     });
 
-    res.json({ ok: true });
+    res.json({ ok: true, requestId: req.requestId });
   } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: error.message || "internal" });
+    return internalError(res, error, req.requestId);
   }
 });
 
 app.post("/notify/message", async (req, res) => {
   try {
     const { roomId, messageId, senderId, receiverId, message, type } = req.body;
-    if (!roomId || !senderId || !receiverId) {
-      return res.status(400).json({ error: "missing fields" });
+    const missing = requireFields(req.body, ["roomId", "senderId", "receiverId"]);
+    if (missing.length > 0) {
+      return badRequest(res, `missing fields: ${missing.join(", ")}`, req.requestId);
     }
 
     if (await messageAlreadyHandled(roomId, messageId)) {
       return res
         .status(202)
-        .json({ ok: true, skipped: "handled_by_firestore_trigger" });
+        .json({ ok: true, skipped: "handled_by_firestore_trigger", requestId: req.requestId });
     }
 
     const chatRef = db.collection("chats").doc(roomId);
@@ -334,29 +383,29 @@ app.post("/notify/message", async (req, res) => {
       },
     });
 
-    res.json({ ok: true });
+    res.json({ ok: true, requestId: req.requestId });
   } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: "internal" });
+    return internalError(res, error, req.requestId);
   }
 });
 
 app.post("/notify/like", async (req, res) => {
   try {
     const { postId, actorId } = req.body;
-    if (!postId || !actorId) {
-      return res.status(400).json({ error: "missing fields" });
+    const missing = requireFields(req.body, ["postId", "actorId"]);
+    if (missing.length > 0) {
+      return badRequest(res, `missing fields: ${missing.join(", ")}`, req.requestId);
     }
 
     if (await likeAlreadyHandled(postId, actorId)) {
       return res
         .status(202)
-        .json({ ok: true, skipped: "handled_by_firestore_trigger" });
+        .json({ ok: true, skipped: "handled_by_firestore_trigger", requestId: req.requestId });
     }
 
     const postDoc = await db.collection("posts").doc(postId).get();
     if (!postDoc.exists) {
-      return res.status(404).json({ error: "post not found" });
+      return res.status(404).json({ ok: false, error: "post not found", requestId: req.requestId });
     }
 
     const post = postDoc.data();
@@ -381,18 +430,18 @@ app.post("/notify/like", async (req, res) => {
       },
     });
 
-    res.json({ ok: true });
+    res.json({ ok: true, requestId: req.requestId });
   } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: "internal" });
+    return internalError(res, error, req.requestId);
   }
 });
 
 app.post("/notify/follow", async (req, res) => {
   try {
     const { userId, followerId } = req.body;
-    if (!userId || !followerId) {
-      return res.status(400).json({ error: "missing fields" });
+    const missing = requireFields(req.body, ["userId", "followerId"]);
+    if (missing.length > 0) {
+      return badRequest(res, `missing fields: ${missing.join(", ")}`, req.requestId);
     }
 
     await pushActivity(userId, { type: "follow", actorId: followerId });
@@ -404,23 +453,23 @@ app.post("/notify/follow", async (req, res) => {
       },
     });
 
-    res.json({ ok: true });
+    res.json({ ok: true, requestId: req.requestId });
   } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: "internal" });
+    return internalError(res, error, req.requestId);
   }
 });
 
 app.post("/story/reply", async (req, res) => {
   try {
     const { storyId, senderId, message } = req.body;
-    if (!storyId || !senderId) {
-      return res.status(400).json({ error: "missing fields" });
+    const missing = requireFields(req.body, ["storyId", "senderId"]);
+    if (missing.length > 0) {
+      return badRequest(res, `missing fields: ${missing.join(", ")}`, req.requestId);
     }
 
     const storyDoc = await db.collection("stories").doc(storyId).get();
     if (!storyDoc.exists) {
-      return res.status(404).json({ error: "story not found" });
+      return res.status(404).json({ ok: false, error: "story not found", requestId: req.requestId });
     }
 
     const story = storyDoc.data();
@@ -438,31 +487,30 @@ app.post("/story/reply", async (req, res) => {
       },
     });
 
-    res.json({ ok: true });
+    res.json({ ok: true, requestId: req.requestId });
   } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: "internal" });
+    return internalError(res, error, req.requestId);
   }
 });
 
 app.post("/activity/visit", async (req, res) => {
   try {
     const { userId, visitorId } = req.body;
-    if (!userId || !visitorId) {
-      return res.status(400).json({ error: "missing fields" });
+    const missing = requireFields(req.body, ["userId", "visitorId"]);
+    if (missing.length > 0) {
+      return badRequest(res, `missing fields: ${missing.join(", ")}`, req.requestId);
     }
 
     if (await profileVisitAlreadyHandled(userId, visitorId)) {
       return res
         .status(202)
-        .json({ ok: true, skipped: "handled_by_firestore_trigger" });
+        .json({ ok: true, skipped: "handled_by_firestore_trigger", requestId: req.requestId });
     }
 
     await pushActivity(userId, { type: "profile_visit", actorId: visitorId });
-    res.json({ ok: true });
+    res.json({ ok: true, requestId: req.requestId });
   } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: "internal" });
+    return internalError(res, error, req.requestId);
   }
 });
 
