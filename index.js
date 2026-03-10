@@ -1,0 +1,471 @@
+import bodyParser from "body-parser";
+import cors from "cors";
+import express from "express";
+import admin from "firebase-admin";
+import fs from "fs";
+import { nanoid } from "nanoid";
+import path from "path";
+
+const { PORT = 3000 } = process.env;
+
+function parseServiceAccountFromEnv() {
+  const raw = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
+  if (!raw) return null;
+
+  try {
+    return JSON.parse(Buffer.from(raw, "base64").toString("utf8"));
+  } catch (_) {}
+
+  try {
+    return JSON.parse(raw);
+  } catch (_) {}
+
+  return null;
+}
+
+function parseServiceAccountFromParts() {
+  const {
+    FIREBASE_PROJECT_ID,
+    FIREBASE_CLIENT_EMAIL,
+    FIREBASE_PRIVATE_KEY,
+  } = process.env;
+
+  if (!FIREBASE_PROJECT_ID || !FIREBASE_CLIENT_EMAIL || !FIREBASE_PRIVATE_KEY) {
+    return null;
+  }
+
+  return {
+    projectId: FIREBASE_PROJECT_ID,
+    clientEmail: FIREBASE_CLIENT_EMAIL,
+    privateKey: FIREBASE_PRIVATE_KEY.replace(/\\n/g, "\n"),
+  };
+}
+
+function parseServiceAccountFromFile() {
+  const localPath = path.join(process.cwd(), "firebase-service-account.json");
+  if (!fs.existsSync(localPath)) return null;
+
+  return JSON.parse(fs.readFileSync(localPath, "utf8"));
+}
+
+function initAdmin() {
+  if (admin.apps.length) return admin.app();
+
+  const serviceAccount =
+    parseServiceAccountFromEnv() ??
+    parseServiceAccountFromParts() ??
+    parseServiceAccountFromFile();
+
+  if (serviceAccount) {
+    return admin.initializeApp({
+      credential: admin.credential.cert(serviceAccount),
+    });
+  }
+
+  console.warn(
+    "Firebase credentials missing. Set FIREBASE_SERVICE_ACCOUNT_JSON or FIREBASE_PROJECT_ID/FIREBASE_CLIENT_EMAIL/FIREBASE_PRIVATE_KEY."
+  );
+  return admin.initializeApp();
+}
+
+initAdmin();
+
+const db = admin.firestore();
+const messaging = admin.messaging();
+
+const app = express();
+app.use(cors());
+app.use(bodyParser.json({ limit: "10mb" }));
+
+const liveCalls = [];
+const sseClients = new Set();
+
+function broadcast(event) {
+  const data = `data: ${JSON.stringify(event)}\n\n`;
+  for (const res of sseClients) {
+    res.write(data);
+  }
+}
+
+async function pushActivity(userId, payload) {
+  const ref = db.collection("activities").doc(userId).collection("items");
+  await ref.add({
+    ...payload,
+    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    isRead: false,
+  });
+}
+
+async function sendPushToUser(targetUserId, notification) {
+  const userDoc = await db.collection("users").doc(targetUserId).get();
+  const token = userDoc.exists ? userDoc.data().fcmToken : null;
+  if (!token) return;
+  await messaging.send({ token, ...notification });
+}
+
+async function messageAlreadyHandled(roomId, messageId) {
+  if (!roomId || !messageId) return false;
+  const doc = await db
+    .collection("chats")
+    .doc(roomId)
+    .collection("messages")
+    .doc(messageId)
+    .get();
+  return doc.exists;
+}
+
+async function likeAlreadyHandled(postId, actorId) {
+  if (!postId || !actorId) return false;
+  const doc = await db
+    .collection("posts")
+    .doc(postId)
+    .collection("likes")
+    .doc(actorId)
+    .get();
+  return doc.exists;
+}
+
+async function profileVisitAlreadyHandled(userId, visitorId) {
+  if (!userId || !visitorId) return false;
+  const doc = await db
+    .collection("profileVisits")
+    .doc(userId)
+    .collection("visitors")
+    .doc(visitorId)
+    .get();
+  return doc.exists;
+}
+
+app.get("/ping", (_req, res) => {
+  res.json({ ok: true, service: "auraconnect-backend" });
+});
+
+app.get("/", (_req, res) => {
+  res.send(`<!doctype html>
+<html>
+<head>
+  <title>AuraConnect Backend</title>
+  <style>
+    body { font-family: Arial, sans-serif; background:#0f0f0f; color:#fff; margin: 24px; }
+    .card { border:1px solid #333; padding:12px; margin:10px 0; border-radius:8px; }
+    .row { display:flex; justify-content:space-between; gap: 12px; }
+    .badge { padding:2px 6px; border-radius:6px; background:#ff4081; color:#fff; font-size:12px; }
+    code { color: #7ee7ff; }
+  </style>
+</head>
+<body>
+  <h2>AuraConnect Backend</h2>
+  <p>Health: <code>/ping</code></p>
+  <p>Live call feed: <code>/events</code></p>
+  <div id="feed"></div>
+<script>
+  const feed = document.getElementById('feed');
+  const evt = new EventSource('/events');
+  evt.onmessage = (e) => {
+    const ev = JSON.parse(e.data);
+    const div = document.createElement('div');
+    div.className = 'card';
+    div.innerHTML = '<div class="row"><div><strong>' + ev.callerName +
+      '</strong> -> <strong>' + ev.receiverId +
+      '</strong></div><div class="badge">' + ev.status + '</div></div>' +
+      '<div>callId: ' + ev.callId + '</div>' +
+      '<div>channel: ' + ev.channelId + '</div>' +
+      '<div>time: ' + new Date(ev.timestamp).toLocaleString() + '</div>';
+    feed.prepend(div);
+  };
+</script>
+</body>
+</html>`);
+});
+
+app.get("/events", (req, res) => {
+  res.set({
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+    Connection: "keep-alive",
+  });
+  res.flushHeaders();
+  sseClients.add(res);
+  req.on("close", () => sseClients.delete(res));
+});
+
+app.post("/send-call", handleSendCall);
+app.post("/send-call-notification", handleSendCall);
+
+async function handleSendCall(req, res) {
+  try {
+    const {
+      callId,
+      callerId,
+      callerName,
+      callerPic = "",
+      channelId,
+      receiverFcmToken,
+      receiverId = "<hidden>",
+    } = req.body;
+
+    if (!callId || !callerId || !callerName || !channelId || !receiverFcmToken) {
+      return res.status(400).json({
+        error:
+          "missing fields: callId, callerId, callerName, channelId, receiverFcmToken",
+      });
+    }
+
+    await messaging.send({
+      token: receiverFcmToken,
+      android: {
+        priority: "high",
+        notification: {
+          title: callerName || "Incoming call",
+          body: "Tap to answer",
+          channelId: "calls_channel_v4",
+          sound: "call_ringtone",
+          priority: "max",
+          visibility: "public",
+        },
+      },
+      notification: {
+        title: callerName || "Incoming call",
+        body: "Tap to answer",
+      },
+      data: {
+        type: "call",
+        callId,
+        callerId,
+        callerName,
+        callerPic,
+        channelId,
+      },
+    });
+
+    const event = {
+      id: nanoid(),
+      callId,
+      callerId,
+      callerName,
+      callerPic,
+      channelId,
+      receiverId,
+      status: "sent",
+      timestamp: Date.now(),
+    };
+    liveCalls.unshift(event);
+    broadcast(event);
+
+    res.json({ ok: true });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: error.message || "internal" });
+  }
+}
+
+app.post("/send-chat", async (req, res) => {
+  try {
+    const { receiverFcmToken, title, body, chatId, senderId, senderName } = req.body;
+    if (!receiverFcmToken) {
+      return res.status(400).json({ error: "receiverFcmToken required" });
+    }
+
+    await messaging.send({
+      token: receiverFcmToken,
+      android: { priority: "high" },
+      notification: {
+        title: title || senderName || "New message",
+        body: body || "",
+      },
+      data: {
+        type: "chat",
+        chatId: chatId || "",
+        senderId: senderId || "",
+        senderName: senderName || title || "",
+        body: body || "",
+      },
+    });
+
+    res.json({ ok: true });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: error.message || "internal" });
+  }
+});
+
+app.post("/notify/message", async (req, res) => {
+  try {
+    const { roomId, messageId, senderId, receiverId, message, type } = req.body;
+    if (!roomId || !senderId || !receiverId) {
+      return res.status(400).json({ error: "missing fields" });
+    }
+
+    if (await messageAlreadyHandled(roomId, messageId)) {
+      return res
+        .status(202)
+        .json({ ok: true, skipped: "handled_by_firestore_trigger" });
+    }
+
+    const chatRef = db.collection("chats").doc(roomId);
+    await chatRef.set(
+      {
+        roomId,
+        participants: [senderId, receiverId],
+        lastMessage: message || "[media]",
+        lastMessageType: type || "text",
+        lastMessageTime: admin.firestore.FieldValue.serverTimestamp(),
+        unread: { [receiverId]: admin.firestore.FieldValue.increment(1) },
+      },
+      { merge: true }
+    );
+
+    await pushActivity(receiverId, {
+      type: "message",
+      actorId: senderId,
+      message: message || "[media]",
+      chatId: roomId,
+    });
+    await sendPushToUser(receiverId, {
+      data: {
+        type: "chat",
+        sender: senderId,
+        chatId: roomId,
+        messageId: messageId || "",
+      },
+      notification: {
+        title: "New message",
+        body: message || "You have a new message",
+      },
+    });
+
+    res.json({ ok: true });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "internal" });
+  }
+});
+
+app.post("/notify/like", async (req, res) => {
+  try {
+    const { postId, actorId } = req.body;
+    if (!postId || !actorId) {
+      return res.status(400).json({ error: "missing fields" });
+    }
+
+    if (await likeAlreadyHandled(postId, actorId)) {
+      return res
+        .status(202)
+        .json({ ok: true, skipped: "handled_by_firestore_trigger" });
+    }
+
+    const postDoc = await db.collection("posts").doc(postId).get();
+    if (!postDoc.exists) {
+      return res.status(404).json({ error: "post not found" });
+    }
+
+    const post = postDoc.data();
+    await db
+      .collection("posts")
+      .doc(postId)
+      .set(
+        { likeCount: admin.firestore.FieldValue.increment(1) },
+        { merge: true }
+      );
+    await pushActivity(post.ownerId, {
+      type: "like",
+      actorId,
+      postId,
+      mediaUrl: post.mediaUrl,
+    });
+    await sendPushToUser(post.ownerId, {
+      data: { type: "like", actor: actorId, postId },
+      notification: {
+        title: "New like",
+        body: "Someone liked your post",
+      },
+    });
+
+    res.json({ ok: true });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "internal" });
+  }
+});
+
+app.post("/notify/follow", async (req, res) => {
+  try {
+    const { userId, followerId } = req.body;
+    if (!userId || !followerId) {
+      return res.status(400).json({ error: "missing fields" });
+    }
+
+    await pushActivity(userId, { type: "follow", actorId: followerId });
+    await sendPushToUser(userId, {
+      data: { type: "follow", actor: followerId },
+      notification: {
+        title: "New follower",
+        body: "You have a new follower",
+      },
+    });
+
+    res.json({ ok: true });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "internal" });
+  }
+});
+
+app.post("/story/reply", async (req, res) => {
+  try {
+    const { storyId, senderId, message } = req.body;
+    if (!storyId || !senderId) {
+      return res.status(400).json({ error: "missing fields" });
+    }
+
+    const storyDoc = await db.collection("stories").doc(storyId).get();
+    if (!storyDoc.exists) {
+      return res.status(404).json({ error: "story not found" });
+    }
+
+    const story = storyDoc.data();
+    await pushActivity(story.ownerId, {
+      type: "story_reply",
+      actorId: senderId,
+      storyId,
+      message: message || "",
+    });
+    await sendPushToUser(story.ownerId, {
+      data: { type: "story_reply", storyId, actor: senderId },
+      notification: {
+        title: "Story reply",
+        body: message || "Someone replied to your story",
+      },
+    });
+
+    res.json({ ok: true });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "internal" });
+  }
+});
+
+app.post("/activity/visit", async (req, res) => {
+  try {
+    const { userId, visitorId } = req.body;
+    if (!userId || !visitorId) {
+      return res.status(400).json({ error: "missing fields" });
+    }
+
+    if (await profileVisitAlreadyHandled(userId, visitorId)) {
+      return res
+        .status(202)
+        .json({ ok: true, skipped: "handled_by_firestore_trigger" });
+    }
+
+    await pushActivity(userId, { type: "profile_visit", actorId: visitorId });
+    res.json({ ok: true });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "internal" });
+  }
+});
+
+app.listen(PORT, () => {
+  console.log(`AuraConnect backend listening on ${PORT}`);
+});
