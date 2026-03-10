@@ -6,8 +6,12 @@ import fs from "fs";
 import { nanoid } from "nanoid";
 import path from "path";
 
-const { PORT = 3000 } = process.env;
+const { PORT = 3000, ALLOWED_ORIGINS = "" } = process.env;
 const APP_VERSION = process.env.RENDER_GIT_COMMIT || process.env.npm_package_version || "dev";
+const allowedOrigins = ALLOWED_ORIGINS
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter(Boolean);
 
 function parseServiceAccountFromEnv() {
   const raw = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
@@ -75,17 +79,39 @@ const db = admin.firestore();
 const messaging = admin.messaging();
 
 const app = express();
-app.use(cors());
+app.use(
+  cors({
+    origin(origin, callback) {
+      if (!origin || allowedOrigins.length === 0 || allowedOrigins.includes(origin)) {
+        return callback(null, true);
+      }
+      return callback(new Error("Origin not allowed by CORS"));
+    },
+  })
+);
 app.use(bodyParser.json({ limit: "10mb" }));
 app.disable("x-powered-by");
 
 const liveCalls = [];
 const sseClients = new Set();
+const rateLimitBuckets = new Map();
+
+function getClientIp(req) {
+  const forwarded = req.headers["x-forwarded-for"];
+  if (typeof forwarded === "string" && forwarded.trim()) {
+    return forwarded.split(",")[0].trim();
+  }
+  return req.ip || req.socket?.remoteAddress || "unknown";
+}
 
 app.use((req, res, next) => {
   const requestId = nanoid(10);
   req.requestId = requestId;
   res.setHeader("x-request-id", requestId);
+  res.setHeader("x-content-type-options", "nosniff");
+  res.setHeader("x-frame-options", "DENY");
+  res.setHeader("referrer-policy", "no-referrer");
+  res.setHeader("permissions-policy", "camera=(), microphone=(), geolocation=()");
   const startedAt = Date.now();
   res.on("finish", () => {
     console.log(
@@ -122,6 +148,51 @@ function requireFields(body, fields) {
   });
   return missing;
 }
+
+function createRateLimit({ key, max, windowMs }) {
+  return (req, res, next) => {
+    const now = Date.now();
+    const bucketKey = `${key}:${getClientIp(req)}`;
+    const bucket = rateLimitBuckets.get(bucketKey);
+
+    if (!bucket || bucket.resetAt <= now) {
+      rateLimitBuckets.set(bucketKey, {
+        count: 1,
+        resetAt: now + windowMs,
+      });
+      return next();
+    }
+
+    if (bucket.count >= max) {
+      const retryAfterSeconds = Math.max(
+        1,
+        Math.ceil((bucket.resetAt - now) / 1000)
+      );
+      res.setHeader("retry-after", retryAfterSeconds);
+      return res.status(429).json({
+        ok: false,
+        error: "rate limit exceeded",
+        requestId: req.requestId,
+        retryAfterSeconds,
+      });
+    }
+
+    bucket.count += 1;
+    return next();
+  };
+}
+
+const notificationRateLimit = createRateLimit({
+  key: "notify",
+  max: 60,
+  windowMs: 60 * 1000,
+});
+
+const callRateLimit = createRateLimit({
+  key: "call",
+  max: 20,
+  windowMs: 60 * 1000,
+});
 
 async function pushActivity(userId, payload) {
   const ref = db.collection("activities").doc(userId).collection("items");
@@ -230,8 +301,8 @@ app.get("/events", (req, res) => {
   req.on("close", () => sseClients.delete(res));
 });
 
-app.post("/send-call", handleSendCall);
-app.post("/send-call-notification", handleSendCall);
+app.post("/send-call", callRateLimit, handleSendCall);
+app.post("/send-call-notification", callRateLimit, handleSendCall);
 
 async function handleSendCall(req, res) {
   try {
@@ -307,7 +378,7 @@ async function handleSendCall(req, res) {
   }
 }
 
-app.post("/send-chat", async (req, res) => {
+app.post("/send-chat", notificationRateLimit, async (req, res) => {
   try {
     const { receiverFcmToken, title, body, chatId, senderId, senderName } = req.body;
     const missing = requireFields(req.body, ["receiverFcmToken"]);
@@ -337,7 +408,7 @@ app.post("/send-chat", async (req, res) => {
   }
 });
 
-app.post("/notify/message", async (req, res) => {
+app.post("/notify/message", notificationRateLimit, async (req, res) => {
   try {
     const { roomId, messageId, senderId, receiverId, message, type } = req.body;
     const missing = requireFields(req.body, ["roomId", "senderId", "receiverId"]);
@@ -389,7 +460,7 @@ app.post("/notify/message", async (req, res) => {
   }
 });
 
-app.post("/notify/like", async (req, res) => {
+app.post("/notify/like", notificationRateLimit, async (req, res) => {
   try {
     const { postId, actorId } = req.body;
     const missing = requireFields(req.body, ["postId", "actorId"]);
@@ -436,7 +507,7 @@ app.post("/notify/like", async (req, res) => {
   }
 });
 
-app.post("/notify/follow", async (req, res) => {
+app.post("/notify/follow", notificationRateLimit, async (req, res) => {
   try {
     const { userId, followerId } = req.body;
     const missing = requireFields(req.body, ["userId", "followerId"]);
@@ -459,7 +530,7 @@ app.post("/notify/follow", async (req, res) => {
   }
 });
 
-app.post("/story/reply", async (req, res) => {
+app.post("/story/reply", notificationRateLimit, async (req, res) => {
   try {
     const { storyId, senderId, message } = req.body;
     const missing = requireFields(req.body, ["storyId", "senderId"]);
@@ -493,7 +564,7 @@ app.post("/story/reply", async (req, res) => {
   }
 });
 
-app.post("/activity/visit", async (req, res) => {
+app.post("/activity/visit", notificationRateLimit, async (req, res) => {
   try {
     const { userId, visitorId } = req.body;
     const missing = requireFields(req.body, ["userId", "visitorId"]);
